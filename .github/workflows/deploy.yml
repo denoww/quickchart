@@ -46,7 +46,7 @@ jobs:
       ec2_com_tag: quickchart
       remote_cmd: >-
         curl -fsSL https://gist.githubusercontent.com/denoww/5044b8da36f85afabb920263925684e9/raw |
-        sudo -E env HOME="$HOME" bash -s -- --tags "projetos=quickchart" --alb-name "seucondominio-web" --ports "https:3008:http:3008" --tcp-healthy-threshold 3 --tcp-unhealthy-threshold 3 --region "us-east-1" --certificado-https-arn "arn:aws:acm:us-east-1:516862767124:certificate/99570c7a-1fb8-4e70-b340-637f7bcaa535"
+        sudo -E env HOME="$HOME" bash -s -- --tags "projetos=quickchart" --alb-name "seucondominio-web" --ports "https:3008:http:3008" --http-healthy-threshold 3 --http-unhealthy-threshold 3 --health-check-path "/healthcheck" --region "us-east-1" --certificado-https-arn "arn:aws:acm:us-east-1:516862767124:certificate/99570c7a-1fb8-4e70-b340-637f7bcaa535"
     secrets:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
