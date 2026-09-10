@@ -1,6 +1,11 @@
 services:
   quickchart:
-    image: ianw/quickchart
+    # Pinada em 10/09/2026 (item #15 do ROADMAP_dependencias_criticas.md,
+    # seucondominio) — confirmado via SSM (workflow 99_inspect_version.yml)
+    # que a instância roda no mesmo digest de v1.8.1 (sha256:12e2d442e2db...).
+    # Projeto upstream não publica nada desde 2023-10-02 — pin não muda um
+    # byte do que já roda, só remove o risco de :latest se mexer no futuro.
+    image: ianw/quickchart:v1.8.1
     restart: unless-stopped
     ports:
       - "3008:3008"
