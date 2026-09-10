@@ -32,7 +32,7 @@ jobs:
           set -eu
 
           INSTANCE_IDS=$(aws ec2 describe-instances \
-            --filters "Name=tag:projetos,Values=quickchart" \
+            --filters "Name=tag:projetos,Values=*quickchart*" \
                       "Name=instance-state-name,Values=running" \
             --query "Reservations[].Instances[].InstanceId" --output text)
 
