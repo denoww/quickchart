@@ -1,0 +1,75 @@
+name: Inspect QuickChart version (read-only)
+
+# Ferramenta de diagnóstico — confirma a imagem/digest do QuickChart rodando
+# na EC2 sem recriar nada. Item #15 do ROADMAP_dependencias_criticas.md
+# (seucondominio): a imagem não tem tag (`ianw/quickchart` = `:latest`
+# implícito), versão não confirmada ao vivo. A Docker Hub API já mostra que
+# `latest` e `v1.8.1` compartilham o mesmo digest (projeto não publica nada
+# desde 2023-10-02) — este workflow confirma que a instância realmente está
+# nesse digest antes de pinar a tag no compose.
+#
+# `pull_request` dispara pra rodar ainda neste PR (workflow_dispatch só
+# fica disponível depois de mergeado na branch default).
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - '.github/workflows/99_inspect_version.yml'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            us-east-1
+
+      - name: docker inspect quickchart na EC2 (read-only)
+        run: |
+          set -eu
+
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=tag:projetos,Values=quickchart" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[].Instances[].InstanceId" --output text)
+
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "Nenhuma EC2 com tag projetos=quickchart encontrada."
+            exit 1
+          fi
+
+          echo "EC2s alvo: $INSTANCE_IDS"
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids $INSTANCE_IDS \
+            --document-name "AWS-RunShellScript" \
+            --comment "quickchart: inspect version (read-only, sem restart)" \
+            --timeout-seconds 60 \
+            --parameters 'commands=["cd /opt/quickchart && docker inspect $(docker compose ps -q quickchart) --format \"image={{.Config.Image}} id={{.Id}} created={{.Created}}\" && docker images ianw/quickchart --format \"tag={{.Tag}} digest={{.Digest}} created={{.CreatedAt}}\""]' \
+            --query "Command.CommandId" --output text)
+
+          echo "SSM Command ID: $CMD_ID"
+
+          for id in $INSTANCE_IDS; do
+            FINAL=""
+            for i in $(seq 1 12); do
+              sleep 5
+              STATUS=$(aws ssm get-command-invocation \
+                --command-id "$CMD_ID" --instance-id "$id" \
+                --query "Status" --output text 2>/dev/null || echo "Pending")
+              case "$STATUS" in
+                Success|Failed|TimedOut|Cancelled) FINAL="$STATUS"; break ;;
+              esac
+            done
+
+            echo "=== EC2 $id → $FINAL ==="
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" \
+              --query "StandardOutputContent" --output text || true
+            aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$id" \
+              --query "StandardErrorContent" --output text || true
+
+            [ "$FINAL" = "Success" ] || exit 1
+          done
