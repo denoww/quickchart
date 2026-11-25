@@ -38,15 +38,13 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
-  ligar_load_balancer:
-    needs: deploy
-    uses: denoww/github_actions/.github/workflows/rodar_comandos_em_todos_ec2_com_tag.yml@main
-    with:
-      aws_region: us-east-1
-      ec2_com_tag: quickchart
-      remote_cmd: >-
-        curl -fsSL https://gist.githubusercontent.com/denoww/5044b8da36f85afabb920263925684e9/raw |
-        sudo -E env HOME="$HOME" bash -s -- --tags "projetos=quickchart" --alb-name "seucondominio-web" --ports "https:3008:http:3008" --healthy-threshold 3 --unhealthy-threshold 3 --health-path "/healthcheck" --region "us-east-1" --certificado-https-arn "arn:aws:acm:us-east-1:516862767124:certificate/99570c7a-1fb8-4e70-b340-637f7bcaa535"
-    secrets:
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  # ☠️ AQUI VIVIA `ligar_load_balancer`, REMOVIDO EM 24/11/2026. Não recrie.
+  #
+  # Ele rodava a cada push na main e (re)criava o listener HTTPS :3008 no ALB PÚBLICO
+  # seucondominio-web apontando para o QuickChart. Foi exatamente por esse listener
+  # (app.seucondominio.com.br:3008/chart) que entrou o ataque de 15–17/10/2026: RCE pelo
+  # `new Function` da config → IMDS → role MultiServiceEC2 → .env do S3. O listener foi removido
+  # à mão em 20–21/10; com este job aqui, o próximo merge o recriaria.
+  #
+  # O QuickChart é serviço INTERNO: só o ERP o chama, por IP privado na VPC (SG do box). Se um
+  # dia precisar de TLS ou nome, use um ALB/NLB INTERNO (scheme internal), nunca o público.

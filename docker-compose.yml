@@ -1,14 +1,205 @@
+# QuickChart self-hosted do ERP — DOIS containers, de propósito.
+#
+# ☠️ POR QUE EXISTE O `guard` (incidente 15–17/10/2026, PSC-118)
+# O QuickChart 1.8.1, quando recebe `c` como STRING, faz
+#   new Function(..., "return " + c)          (lib/charts.js:136 do upstream)
+# sem sandbox nenhum: é execução de JS arbitrário no container. Foi por aí que o atacante
+# entrou (via listener :3008 do ALB), chegou ao IMDS, levou a credencial da role da EC2 e leu
+# os .env do S3. Quando `c` chega como OBJETO JSON (POST com body JSON), o QuickChart usa o
+# objeto direto e o eval não acontece.
+#
+# O `guard` é a única porta de entrada: aceita só GET/POST /chart e GET /healthcheck, exige que
+# `c` seja JSON puro (JSON.parse, objeto) e repassa ao QuickChart como OBJETO. Função, JS,
+# base64, /gchart (graphviz), /qr, svg/pdf: tudo recusado com 400/404. O ERP já manda
+# `config.to_json` (app/services/quick_chart_service.rb), então para ele nada muda.
+#
+# Defesa em profundidade: o `quickchart` fica SÓ na rede `interna` (internal: true) — sem porta
+# no host, sem rota para fora. Mesmo que alguém achasse outro RCE nele, não alcança o IMDS
+# (169.254.169.254), a internet nem o resto da VPC.
+#
+# ⚠️ O código do guard está inline (node -e) porque o deploy só leva ESTE arquivo ao box
+# (s3://sc-environments/quickchart/docker-compose.yml). Todo `$` do JS vai como `$$`: o compose interpola.
+# Teste local: tests/guard_test.sh.
 services:
   quickchart:
-    # Pinada em 10/09/2026 (item #15 do ROADMAP_dependencias_criticas.md,
-    # seucondominio) — confirmado via SSM (workflow 99_inspect_version.yml)
-    # que a instância roda no mesmo digest de v1.8.1 (sha256:12e2d442e2db...).
-    # Projeto upstream não publica nada desde 2023-10-02 — pin não muda um
-    # byte do que já roda, só remove o risco de :latest se mexer no futuro.
-    image: ianw/quickchart:v1.8.1
+    # Pinada por DIGEST (10/09/2026 tag; 24/11/2026 digest). Digest confirmado na instância via
+    # 99_inspect_version.yml == ianw/quickchart:v1.8.1 na Docker Hub. Upstream parado desde 2023.
+    image: ianw/quickchart:v1.8.1@sha256:12e2d442e2db9974f2b310b72fadd4f6d595d0a0bf5480c3d50ef5cb5967ee56
     restart: unless-stopped
-    ports:
-      - "3008:3008"
     environment:
       PORT: 3008
       WORKERS: 2
+    networks: [interna]
+    # sem `ports:` — só o guard alcança.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 1g
+    pids_limit: 256
+
+  guard:
+    image: node:24-alpine@sha256:116b800c3754b440ee0aa3ed2f20f5bf3d99a554bfd9adeea09ea8017f6e85f5
+    restart: unless-stopped
+    depends_on: [quickchart]
+    ports:
+      - "3008:3008"
+    networks: [interna, saida]
+    user: "node"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 64
+    environment:
+      UPSTREAM_HOST: quickchart
+      UPSTREAM_PORT: 3008
+    command:
+      - node
+      - -e
+      - |
+        'use strict';
+        const http = require('http');
+        const UP_HOST = process.env.UPSTREAM_HOST;
+        const UP_PORT = Number(process.env.UPSTREAM_PORT);
+        const MAX_BYTES = 128 * 1024;
+        const MAX_DIM = 3000;
+        // Nomes aceitos (aliases do próprio QuickChart). Qualquer outro parâmetro => 400.
+        const ALIASES = { c: 'chart', chart: 'chart', w: 'width', width: 'width', h: 'height',
+          height: 'height', bkg: 'backgroundColor', backgroundColor: 'backgroundColor',
+          v: 'version', version: 'version', devicePixelRatio: 'devicePixelRatio',
+          f: 'format', format: 'format', encoding: 'encoding' };
+
+        function log(obj) { console.log(JSON.stringify(Object.assign({ t: new Date().toISOString(), tag: 'quickchart-guard' }, obj))); }
+        function fail(res, code, motivo, req) {
+          log({ ev: 'recusado', code: code, motivo: motivo, method: req.method, path: (req.url || '').split('?')[0], ip: req.socket.remoteAddress });
+          res.writeHead(code, { 'content-type': 'text/plain; charset=utf-8' });
+          res.end(motivo + '\n');
+        }
+        function isPlainObject(x) { return x !== null && typeof x === 'object' && !Array.isArray(x); }
+
+        // Mesmo decode que o QuickChart faz na prática: '+' vira espaço e depois decodeURIComponent
+        // (o `qs` troca o '+' antes do decoder custom do upstream — o comentário dele engana).
+        // O ERP manda URI.encode_www_form (espaço => '+'). Medido: PNG byte a byte igual ao direto.
+        function dec(x) { return decodeURIComponent(x.replace(/\+/g, ' ')); }
+        function parseQuery(qs) {
+          const out = {};
+          if (!qs) return out;
+          for (const part of qs.split('&')) {
+            if (!part) continue;
+            const i = part.indexOf('=');
+            const k = dec(i < 0 ? part : part.slice(0, i));
+            const v = i < 0 ? '' : dec(part.slice(i + 1));
+            if (Object.prototype.hasOwnProperty.call(out, k)) throw new Error('parâmetro repetido: ' + k);
+            out[k] = v;
+          }
+          return out;
+        }
+
+        // Devolve {opts} normalizado ou lança Error com o motivo.
+        function validar(raw) {
+          const o = {};
+          for (const k of Object.keys(raw)) {
+            const n = ALIASES[k];
+            if (!n) throw new Error('parâmetro não aceito: ' + k);
+            if (o[n] !== undefined) throw new Error('parâmetro duplicado: ' + n);
+            o[n] = raw[k];
+          }
+          if (o.encoding !== undefined && o.encoding !== 'url') throw new Error('encoding não aceito');
+          if (o.format !== undefined && String(o.format).toLowerCase() !== 'png') throw new Error('só png');
+
+          let chart = o.chart;
+          if (typeof chart === 'string') {
+            try { chart = JSON.parse(chart); } catch (e) { throw new Error('c precisa ser JSON puro (sem função/JS)'); }
+          }
+          if (!isPlainObject(chart)) throw new Error('c precisa ser um objeto JSON');
+
+          const out = { chart: chart, format: 'png' };
+          for (const d of ['width', 'height']) {
+            if (o[d] === undefined) continue;
+            const s = String(o[d]);
+            if (!/^[0-9]{1,4}$$/.test(s) || Number(s) < 1 || Number(s) > MAX_DIM) throw new Error(d + ' inválido');
+            out[d] = Number(s);
+          }
+          if (o.backgroundColor !== undefined) {
+            const s = String(o.backgroundColor);
+            if (!/^[#a-zA-Z0-9(),. %]{1,40}$$/.test(s)) throw new Error('backgroundColor inválido');
+            out.backgroundColor = s;
+          }
+          if (o.version !== undefined) {
+            const s = String(o.version);
+            if (!/^[0-9][0-9.]{0,9}$$/.test(s)) throw new Error('version inválida');
+            out.version = s;
+          }
+          if (o.devicePixelRatio !== undefined) {
+            const s = String(o.devicePixelRatio);
+            if (!/^[0-9](\.[0-9]{1,2})?$$/.test(s) || Number(s) <= 0 || Number(s) > 3) throw new Error('devicePixelRatio inválido');
+            out.devicePixelRatio = Number(s);
+          }
+          return out;
+        }
+
+        function encaminhar(req, res, payload) {
+          const body = Buffer.from(JSON.stringify(payload));
+          const up = http.request({ host: UP_HOST, port: UP_PORT, method: 'POST', path: '/chart', timeout: 15000,
+            headers: { 'content-type': 'application/json', 'content-length': body.length } }, (ur) => {
+            const h = { 'content-type': ur.headers['content-type'] || 'application/octet-stream' };
+            if (ur.headers['content-length']) h['content-length'] = ur.headers['content-length'];
+            res.writeHead(ur.statusCode, h);
+            ur.pipe(res);
+          });
+          up.on('timeout', () => up.destroy(new Error('timeout')));
+          up.on('error', (e) => { log({ ev: 'upstream_erro', erro: e.message }); if (!res.headersSent) { res.writeHead(502); } res.end(); });
+          up.end(body);
+        }
+
+        function healthcheck(res) {
+          const up = http.get({ host: UP_HOST, port: UP_PORT, path: '/healthcheck', timeout: 5000 }, (ur) => {
+            res.writeHead(ur.statusCode, { 'content-type': ur.headers['content-type'] || 'text/plain' });
+            ur.pipe(res);
+          });
+          up.on('timeout', () => up.destroy(new Error('timeout')));
+          up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+        }
+
+        const server = http.createServer((req, res) => {
+          const url = req.url || '';
+          const q = url.indexOf('?');
+          const path = q < 0 ? url : url.slice(0, q);
+          const qs = q < 0 ? '' : url.slice(q + 1);
+
+          if (path === '/healthcheck' && req.method === 'GET') return healthcheck(res);
+          if (path !== '/chart') return fail(res, 404, 'não encontrado', req);
+          if (url.length > MAX_BYTES) return fail(res, 414, 'URL grande demais', req);
+
+          if (req.method === 'GET') {
+            let opts;
+            try { opts = validar(parseQuery(qs)); } catch (e) { return fail(res, 400, e.message, req); }
+            return encaminhar(req, res, opts);
+          }
+          if (req.method === 'POST') {
+            if (qs) return fail(res, 400, 'POST sem query string', req);
+            const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+            if (ct !== 'application/json') return fail(res, 415, 'só application/json', req);
+            const chunks = []; let n = 0; let abortado = false;
+            req.on('data', (c) => { n += c.length; if (n > MAX_BYTES && !abortado) { abortado = true; fail(res, 413, 'corpo grande demais', req); req.destroy(); } else if (!abortado) chunks.push(c); });
+            req.on('end', () => {
+              if (abortado) return;
+              let raw, opts;
+              try { raw = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return fail(res, 400, 'corpo não é JSON', req); }
+              if (!isPlainObject(raw)) return fail(res, 400, 'corpo precisa ser objeto', req);
+              try { opts = validar(raw); } catch (e) { return fail(res, 400, e.message, req); }
+              return encaminhar(req, res, opts);
+            });
+            return;
+          }
+          return fail(res, 405, 'método não aceito', req);
+        });
+        server.requestTimeout = 20000;
+        server.headersTimeout = 10000;
+        server.listen(3008, () => log({ ev: 'ouvindo', porta: 3008, upstream: UP_HOST + ':' + UP_PORT }));
+
+networks:
+  # Sem rota para fora: nem internet, nem IMDS, nem VPC.
+  interna:
+    internal: true
+  # Só o guard está aqui, para publicar a porta no host.
+  saida: {}
